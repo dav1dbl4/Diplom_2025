@@ -1,0 +1,523 @@
+-------------------------------------------------------------------------------
+-------------------------------------------------------------------------------
+-------------------------------------------------------------------------------
+
+create table auth (auth_id serial primary key, password varchar);
+create extension pgcrypto;
+insert into auth values(default, crypt('1', 'nothing'));
+
+
+-------------------------------------------------------------------------------
+-------------------------------------------------------------------------------
+-------------------------------------------------------------------------------
+
+CREATE TYPE quantity_type AS ENUM ('кг', 'шт');
+
+create table stock("Код товара" serial primary key, "Товар" varchar, "Единица измерения(кг/шт)" quantity_type, "Срок годности(дни)" int, "Цена продажи(тенге)" numeric(10,2), "Себестоимость(тенге)" numeric(10,2));
+
+-------------------------------------------------------------------------------
+
+CREATE OR REPLACE FUNCTION delete_stock(stock_code int)
+RETURNS VOID AS $$
+BEGIN
+    DELETE FROM stock
+    WHERE "Код товара" = stock_code;
+END;
+$$ LANGUAGE plpgsql;
+
+
+-------------------------------------------------------------------------------
+-------------------------------------------------------------------------------
+-------------------------------------------------------------------------------
+
+
+create table buyers("Код покупателя" serial primary key, "Покупатель" varchar, "ИНН" varchar(12), "Контактное лицо" varchar, "Номер телефона" varchar(17));
+
+-------------------------------------------------------------------------------
+
+CREATE OR REPLACE FUNCTION delete_buyer(buyer_code int)
+RETURNS VOID AS $$
+BEGIN
+    DELETE FROM buyers
+    WHERE "Код покупателя" = buyer_code;
+END;
+$$ LANGUAGE plpgsql;
+
+-------------------------------------------------------------------------------
+
+CREATE OR REPLACE FUNCTION format_phone_number()
+RETURNS TRIGGER AS $$
+BEGIN
+    NEW."Номер телефона" := regexp_replace(NEW."Номер телефона", '\D', '', 'g');
+    
+    IF length(NEW."Номер телефона") = 11 THEN
+        NEW."Номер телефона" := '8 (' ||
+            SUBSTRING(NEW."Номер телефона", 2, 3) || ') ' ||
+            SUBSTRING(NEW."Номер телефона", 5, 3) || '-' ||
+            SUBSTRING(NEW."Номер телефона", 8, 2) || '-' ||
+            SUBSTRING(NEW."Номер телефона", 10, 2);
+    END IF;
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+
+CREATE TRIGGER trigger_format_phone
+BEFORE INSERT OR UPDATE ON buyers
+FOR EACH ROW
+EXECUTE FUNCTION format_phone_number();
+
+
+-------------------------------------------------------------------------------
+-------------------------------------------------------------------------------
+-------------------------------------------------------------------------------
+
+create table remains("Код товара" int, "Товар" varchar, "Единица измерения(кг/шт)" quantity_type, "Остаток" int);
+
+CREATE OR REPLACE FUNCTION fill_stock_remains()
+RETURNS TRIGGER AS $$
+BEGIN
+    SELECT "Товар", "Единица измерения(кг/шт)" INTO NEW."Товар", NEW."Единица измерения(кг/шт)" FROM stock WHERE "Код товара" = NEW."Код товара" LIMIT 1;
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+
+CREATE TRIGGER auto_fill_stock_remains
+BEFORE INSERT OR UPDATE ON remains
+FOR EACH ROW
+EXECUTE FUNCTION fill_stock_remains();
+
+
+CREATE OR REPLACE FUNCTION calculate_remains()
+RETURNS void AS $$
+BEGIN
+    UPDATE remains r
+    SET "Остаток" = COALESCE((
+        SELECT SUM(m."Количество" - m."Распродано/Списано")
+        FROM makings m
+        WHERE m."Код товара" = r."Код товара"
+        GROUP BY m."Код товара"
+    ), 0);
+    
+END;
+$$ LANGUAGE plpgsql;
+
+
+CREATE OR REPLACE FUNCTION sync_remains()
+RETURNS TRIGGER AS $$
+BEGIN
+    INSERT INTO remains ("Код товара", "Товар")
+    VALUES (NEW."Код товара", NEW."Товар");
+    
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+
+CREATE TRIGGER after_insert_stock
+AFTER INSERT ON stock
+FOR EACH ROW
+EXECUTE FUNCTION sync_remains();
+
+
+-------------------------------------------------------------------------------
+-------------------------------------------------------------------------------
+-------------------------------------------------------------------------------
+
+create table bad("Код товара" int, "Товар" varchar, "Дата списания" date, "Единица измерения(кг/шт)" quantity_type, "Количество" int);
+
+-------------------------------------------------------------------------------
+-------------------------------------------------------------------------------
+-------------------------------------------------------------------------------
+
+
+create table sales ("Код продажи" serial primary key, "Код покупателя" int, "Код товара" int, "Покупатель" varchar, "Товар" varchar, "Дата продажи" date, "Единица измерения(кг/шт)" quantity_type, "Количество" int not null, check("Количество" >= 1 and "Количество" <=99), "Сумма" numeric(10,2));
+
+-------------------------------------------------------------------------------
+
+CREATE OR REPLACE FUNCTION delete_sale(sale_code int)
+RETURNS VOID AS $$
+BEGIN
+    DELETE FROM sales
+    WHERE "Код продажи" = sale_code;
+END;
+$$ LANGUAGE plpgsql;
+
+-------------------------------------------------------------------------------
+
+CREATE OR REPLACE FUNCTION fill_buyer()
+RETURNS TRIGGER AS $$
+BEGIN
+    SELECT "Покупатель" INTO NEW."Покупатель" FROM buyers WHERE "Код покупателя" = NEW."Код покупателя" LIMIT 1;
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+
+CREATE TRIGGER auto_fill_buyer
+BEFORE INSERT OR UPDATE ON sales
+FOR EACH ROW
+EXECUTE FUNCTION fill_buyer();
+
+
+CREATE OR REPLACE FUNCTION fill_izm()
+RETURNS TRIGGER AS $$
+BEGIN
+    SELECT "Единица измерения(кг/шт)" INTO NEW."Единица измерения(кг/шт)" FROM stock WHERE "Код товара" = NEW."Код товара" LIMIT 1;
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+
+CREATE TRIGGER auto_fill_izm
+BEFORE INSERT OR UPDATE ON sales
+FOR EACH ROW
+EXECUTE FUNCTION fill_izm();
+
+-------------------------------------------------------------------------------
+
+CREATE OR REPLACE FUNCTION fill_stock()
+RETURNS TRIGGER AS $$
+BEGIN
+    SELECT "Товар" INTO NEW."Товар" FROM stock WHERE "Код товара" = NEW."Код товара" LIMIT 1;
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+
+CREATE TRIGGER auto_fill_stock
+BEFORE INSERT OR UPDATE ON sales
+FOR EACH ROW
+EXECUTE FUNCTION fill_stock();
+
+-------------------------------------------------------------------------------
+
+CREATE OR REPLACE FUNCTION calculate_total()
+RETURNS TRIGGER AS $$
+BEGIN
+    SELECT "Цена продажи(тенге)" INTO NEW."Сумма"
+    FROM stock
+    WHERE "Код товара" = NEW."Код товара";
+
+    NEW."Сумма" := NEW."Количество" * COALESCE(NEW."Сумма", 0);
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+
+CREATE TRIGGER auto_fill_total
+BEFORE INSERT ON sales
+FOR EACH ROW
+EXECUTE FUNCTION calculate_total();
+
+-------------------------------------------------------------------------------
+-------------------------------------------------------------------------------
+-------------------------------------------------------------------------------
+
+create table makings("Код изготовления" serial primary key, "Код товара" int, "Товар" varchar, "Дата изготовления" date, "Единица измерения(кг/шт)" quantity_type, "Количество" int, "Распродано/Списано" int);
+
+
+CREATE OR REPLACE FUNCTION decrease_makings(product_code int, amount int)
+RETURNS VOID AS $$
+declare rec RECORD;
+BEGIN
+    WHILE amount > 0 LOOP
+	select * into rec from makings where "Код товара"=product_code and "Количество" <> "Распродано/Списано" ORDER BY "Дата изготовления" ASC
+        LIMIT 1;
+	IF rec."Количество"-rec."Распродано/Списано" >= amount THEN
+		UPDATE makings
+		SET "Распродано/Списано" = "Распродано/Списано" + amount
+                WHERE "Код товара" = product_code 
+                  AND "Дата изготовления" = rec."Дата изготовления";
+                amount := 0;
+	ELSE
+		amount := amount - rec."Количество" + rec."Распродано/Списано";
+		UPDATE makings
+                SET "Распродано/Списано" = "Количество"  -- Устанавливаем количество в 0;
+                WHERE "Код товара" = product_code 
+                  AND "Дата изготовления" = rec."Дата изготовления";
+        END IF;
+    END LOOP;
+END;
+$$ LANGUAGE plpgsql;
+
+
+CREATE OR REPLACE FUNCTION is_expired(production_code INT)
+RETURNS BOOLEAN AS $$
+DECLARE
+    manufacturing_date DATE;
+    shelf_life INT;
+BEGIN
+    SELECT m."Дата изготовления", s."Срок годности(дни)"
+    INTO manufacturing_date, shelf_life
+    FROM makings m
+    JOIN stock s using("Код товара")
+    WHERE m."Код изготовления" = production_code;
+
+    RETURN (current_date - manufacturing_date > shelf_life);
+END;
+$$ LANGUAGE plpgsql;
+
+
+CREATE OR REPLACE FUNCTION find_expired()
+RETURNS table ("Код товара" integer) AS $$
+    select m."Код товара" from makings m join stock s using("Код товара") where current_date - m."Дата изготовления" > s."Срок годности(дни)" and m."Количество"<> m."Распродано/Списано"; 
+$$ LANGUAGE sql;
+
+
+CREATE OR REPLACE FUNCTION find_expired()
+RETURNS table ("Код товара" integer) AS $$
+BEGIN
+    RETURN QUERY 
+    SELECT m."Код товара"
+    FROM makings m
+    JOIN stock s USING("Код товара")
+    WHERE current_date - m."Дата изготовления" > s."Срок годности(дни)" 
+      AND m."Количество" <> m."Распродано/Списано";
+
+    IF NOT FOUND THEN
+        RETURN QUERY SELECT 0;
+    END IF;
+END;
+$$ LANGUAGE plpgsql;
+
+
+CREATE OR REPLACE FUNCTION spisat(production_code INT)
+RETURNS void AS $$
+DECLARE
+    code int;
+    tovar varchar;
+    manufacturing_date DATE;
+    izmerenie quantity_type;
+    spisano INT;
+BEGIN
+    Select m."Код товара", m."Товар", st."Единица измерения(кг/шт)", m."Количество" - m."Распродано/Списано" into code, tovar, izmerenie, spisano
+	from makings m
+		join stock st using("Код товара")
+		where m."Код изготовления" = production_code;
+    INSERT INTO bad values(code, tovar, current_date, izmerenie, spisano);
+    UPDATE makings SET "Распродано/Списано" = "Количество" WHERE "Код изготовления" = production_code; 
+END;
+$$ LANGUAGE plpgsql;
+
+
+CREATE OR REPLACE FUNCTION fill_stock_makings()
+RETURNS TRIGGER AS $$
+BEGIN
+    SELECT "Товар", "Единица измерения(кг/шт)" INTO NEW."Товар", NEW."Единица измерения(кг/шт)" FROM stock WHERE "Код товара" = NEW."Код товара" LIMIT 1;
+    IF NEW."Распродано/Списано" IS NULL THEN
+        NEW."Распродано/Списано" := 0; 
+    END IF;
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+
+CREATE TRIGGER auto_fill_stock_makings
+BEFORE INSERT OR UPDATE ON makings
+FOR EACH ROW
+EXECUTE FUNCTION fill_stock_makings();
+
+
+-------------------------------------------------------------------------------
+-------------------------------------------------------------------------------
+-------------------------------------------------------------------------------
+
+--------------------------Выручка----------------------------------------------
+
+CREATE OR REPLACE FUNCTION calculate_revenue()
+RETURNS numeric(10,2) AS $$
+DECLARE
+    temp int := SUM(b."Количество" * st."Себестоимость(тенге)") from bad b join stock st using("Код товара");
+begin
+    return (SUM(s."Количество" * (st."Цена продажи(тенге)" - st."Себестоимость(тенге)")) - temp)
+    FROM sales s
+    JOIN stock st using("Код товара");
+end;
+$$ LANGUAGE plpgsql;
+
+
+CREATE OR REPLACE FUNCTION calculate_revenue_by_period(timestamp, timestamp)
+RETURNS numeric(10,2) AS $$
+DECLARE
+    temp int := SUM(b."Количество" * st."Себестоимость(тенге)") from bad b join stock st using("Код товара") where b."Дата списания" between $1 and $2;
+begin
+    return (SUM(s."Количество" * (st."Цена продажи(тенге)" - st."Себестоимость(тенге)")) - temp)
+    FROM sales s
+    JOIN stock st using("Код товара")
+	where s."Дата продажи" between $1 and $2;
+end;
+$$ LANGUAGE plpgsql;
+
+
+--------------------------Товар--------------------------------------------------
+
+CREATE OR REPLACE FUNCTION calculate_bestseller()
+RETURNS table("Товар" varchar, "Количество продаж" integer)
+as $$
+SELECT st."Товар", sum(s."Количество") as "Количество продаж"
+    FROM sales s
+    JOIN stock st using("Код товара")
+group by st."Товар"
+order by "Количество продаж" desc
+limit 1; 
+$$ LANGUAGE sql;
+
+
+CREATE OR REPLACE FUNCTION calculate_bestseller_by_period(timestamp, timestamp)
+RETURNS table("Товар" varchar, "Количество продаж" integer)
+as $$
+SELECT st."Товар", sum(s."Количество") as "Количество продаж"
+    FROM sales s
+    JOIN stock st using("Код товара")
+	where s."Дата продажи" between $1 and $2
+group by st."Товар"
+order by "Количество продаж" desc
+limit 1; 
+$$ LANGUAGE sql;
+
+--------------------------Выручка5--------------------------------------------------
+
+CREATE OR REPLACE FUNCTION calculate_revenue5()
+RETURNS table("Товар" varchar, "Выручка" real)
+AS $$
+SELECT s."Товар", SUM(s."Количество" * (st."Цена продажи(тенге)" - st."Себестоимость(тенге)")) as "Выручка"
+    FROM sales s
+    JOIN stock st using("Код товара")
+GROUP BY s."Товар"
+ORDER BY "Выручка" DESC
+LIMIT 5;
+$$ LANGUAGE sql;
+
+
+CREATE OR REPLACE FUNCTION calculate_revenue5_by_period(timestamp, timestamp)
+RETURNS table("Товар" varchar, "Выручка" real)
+AS $$
+SELECT s."Товар", SUM(s."Количество" * (st."Цена продажи(тенге)" - st."Себестоимость(тенге)")) as "Выручка"
+    FROM sales s
+    JOIN stock st using("Код товара")
+	where s."Дата продажи" between $1 and $2
+GROUP BY s."Товар"
+ORDER BY "Выручка" DESC
+LIMIT 5;
+$$ LANGUAGE sql;
+
+--------------------------Диаграмма--------------------------------------------------
+
+CREATE OR REPLACE FUNCTION calculate_diagram()
+RETURNS table("Продажи" numeric(10,2), "Расходы" numeric(10,2))
+AS $$
+declare
+    temp numeric(10,2);
+begin
+    select SUM(b."Количество" * st."Себестоимость(тенге)") into temp from bad b join stock st using("Код товара");
+    return query
+SELECT SUM(s."Количество" * (st."Цена продажи(тенге)")) as "Продажи", SUM(s."Количество" * (st."Себестоимость(тенге)")) + temp as "Расходы"
+    FROM sales s
+    JOIN stock st using("Код товара");
+end;
+$$ LANGUAGE plpgsql;
+
+
+CREATE OR REPLACE FUNCTION calculate_diagram_by_period(timestamp, timestamp)
+RETURNS table("Продажи" numeric(10,2), "Расходы" numeric(10,2))
+AS $$
+declare
+    temp numeric(10,2);
+begin
+    select SUM(b."Количество" * st."Себестоимость(тенге)") into temp from bad b join stock st using("Код товара") where b."Дата списания" between $1 and $2;
+    return query
+SELECT SUM(s."Количество" * (st."Цена продажи(тенге)")) as "Продажи", SUM(s."Количество" * (st."Себестоимость(тенге)")) + temp as "Расходы"
+    FROM sales s
+    JOIN stock st using("Код товара")
+	where s."Дата продажи" between $1 and $2;
+end;
+$$ LANGUAGE plpgsql;
+
+select calculate_diagram_by_period('15.05.2025', '21.05.2025');
+
+
+insert into stock values(default, 'Печенье Тофу', 'кг', '5', '4300', '1100');
+insert into stock values(default, 'Торт Наполеон', 'шт', '5', '7800', '2700');
+insert into stock values(default, 'Пирожное Эклер', 'шт', '5', '2100', '500');
+insert into stock values(default, 'Маффин Шоколадный', 'шт', '5', '2450', '650');
+insert into stock values(default, 'Печенье Овсяное', 'кг', '5', '3730', '1100');
+insert into stock values(default, 'Торт Медовик', 'шт', '5', '3620', '1100');
+insert into stock values(default, 'Пирог Ягодный', 'шт', '5', '3930', '1250');
+insert into stock values(default, 'Торт Брауни', 'шт', '5', '4760', '1500');
+insert into stock values(default, 'Тирамису', 'шт', '5', '3950', '1100');
+insert into stock values(default, 'Чизкейк', 'шт', '5', '2630', '950');
+
+
+
+INSERT INTO buyers VALUES (default, 'Сладкий мир', '5407234516', 'Иванова Анна Николаевна', '87774128490');
+INSERT INTO buyers VALUES (default, 'Кондитерская фантазия', '5407025576', 'Петров Сергей Владимирович', '87714794344');
+INSERT INTO buyers VALUES (default, 'Шоколадный рай', '7722327689', 'Смирнова Ольга Александровна', '87774123943');
+INSERT INTO buyers VALUES (default, 'Сладкие грезы', '7118818033', 'Кузнецов Дмитрий Игоревич', '87053412489');
+INSERT INTO buyers VALUES (default, 'Вкусные радости', '5408130693', 'Зайцева Татьяна Петровна', '87714396465');
+INSERT INTO buyers VALUES (default, 'Нежные десерты', '5407245973', 'Федоров Алексей Сергеевич', '87778995143');
+INSERT INTO buyers VALUES (default, 'Сладости от шефа', '5404161429', 'Григорьева Екатерина Владимировна', '87714898586');
+INSERT INTO buyers VALUES (default, 'Кондитерская мечта', '5407208153', 'Лебедев Максим Юрьевич', '87053129493');
+INSERT INTO buyers VALUES (default, 'Торты', '5448100656', 'Морозова Виктория Олеговна', '87053865981');
+INSERT INTO buyers VALUES (default, 'Сладкое наслаждение', '5408191400', 'Сидоров Василий Андреевич', '87773859643');
+
+
+insert into makings ("Код изготовления", "Код товара", "Дата изготовления", "Количество") values(default, '1', '13.05.2025', 6);
+insert into makings ("Код изготовления", "Код товара", "Дата изготовления", "Количество") values(default, '1', '09.05.2025', 7);
+insert into makings ("Код изготовления", "Код товара", "Дата изготовления", "Количество") values(default, '1', '21.05.2025', 3);
+insert into makings ("Код изготовления", "Код товара", "Дата изготовления", "Количество") values(default, '2', '16.05.2025', 5);
+insert into makings ("Код изготовления", "Код товара", "Дата изготовления", "Количество") values(default, '3', '18.05.2025', 5);
+insert into makings ("Код изготовления", "Код товара", "Дата изготовления", "Количество") values(default, '4', '12.05.2025', 5);
+insert into makings ("Код изготовления", "Код товара", "Дата изготовления", "Количество") values(default, '5', '11.05.2025', 5);
+insert into makings ("Код изготовления", "Код товара", "Дата изготовления", "Количество") values(default, '6', '14.05.2025', 5);
+insert into makings ("Код изготовления", "Код товара", "Дата изготовления", "Количество") values(default, '7', '19.05.2025', 5);
+insert into makings ("Код изготовления", "Код товара", "Дата изготовления", "Количество") values(default, '8', '17.05.2025', 5);
+insert into makings ("Код изготовления", "Код товара", "Дата изготовления", "Количество") values(default, '9', '18.05.2025', 5);
+insert into makings ("Код изготовления", "Код товара", "Дата изготовления", "Количество") values(default, '10', '21.05.2025', 5);
+
+
+insert into sales ("Код продажи", "Код покупателя", "Код товара", "Дата продажи", "Количество") values(default, 1, 1, '12.05.2025', 3);
+insert into sales ("Код продажи", "Код покупателя", "Код товара", "Дата продажи", "Количество") values(default, 1, 1, '13.05.2025', 5);
+insert into sales ("Код продажи", "Код покупателя", "Код товара", "Дата продажи", "Количество") values(default, 8, 9, '20.05.2025', 1);
+insert into sales ("Код продажи", "Код покупателя", "Код товара", "Дата продажи", "Количество") values(default, 8, 9, '18.05.2025', 4);
+insert into sales ("Код продажи", "Код покупателя", "Код товара", "Дата продажи", "Количество") values(default, 4, 2, '19.05.2025', 3);
+insert into sales ("Код продажи", "Код покупателя", "Код товара", "Дата продажи", "Количество") values(default, 1, 1, '15.05.2025', 4);
+insert into sales ("Код продажи", "Код покупателя", "Код товара", "Дата продажи", "Количество") values(default, 2, 6, '18.05.2025', 2);
+insert into sales ("Код продажи", "Код покупателя", "Код товара", "Дата продажи", "Количество") values(default, 5, 5, '13.05.2025', 3);
+insert into sales ("Код продажи", "Код покупателя", "Код товара", "Дата продажи", "Количество") values(default, 7, 3, '20.05.2025', 5);
+insert into sales ("Код продажи", "Код покупателя", "Код товара", "Дата продажи", "Количество") values(default, 2, 6, '16.05.2025', 2);
+insert into sales ("Код продажи", "Код покупателя", "Код товара", "Дата продажи", "Количество") values(default, 2, 6, '16.05.2025', 1);
+insert into sales ("Код продажи", "Код покупателя", "Код товара", "Дата продажи", "Количество") values(default, 6, 7, '19.05.2025', 2);
+insert into sales ("Код продажи", "Код покупателя", "Код товара", "Дата продажи", "Количество") values(default, 5, 5, '11.05.2025', 1);
+insert into sales ("Код продажи", "Код покупателя", "Код товара", "Дата продажи", "Количество") values(default, 5, 5, '14.05.2025', 1);
+insert into sales ("Код продажи", "Код покупателя", "Код товара", "Дата продажи", "Количество") values(default, 4, 8, '20.05.2025', 3);
+insert into sales ("Код продажи", "Код покупателя", "Код товара", "Дата продажи", "Количество") values(default, 6, 7, '21.05.2025', 3);
+insert into sales ("Код продажи", "Код покупателя", "Код товара", "Дата продажи", "Количество") values(default, 4, 2, '17.05.2025', 2);
+insert into sales ("Код продажи", "Код покупателя", "Код товара", "Дата продажи", "Количество") values(default, 4, 8, '18.05.2025', 2);
+insert into sales ("Код продажи", "Код покупателя", "Код товара", "Дата продажи", "Количество") values(default, 3, 4, '13.05.2025', 5);
+
+
+select decrease_makings(1,3);
+select decrease_makings(1,5);
+select decrease_makings(9,1);
+select decrease_makings(9,4);
+select decrease_makings(2,3);
+select decrease_makings(1,4);
+select decrease_makings(6,2);
+select decrease_makings(5,3);
+select decrease_makings(3,5);
+select decrease_makings(6,2);
+select decrease_makings(6,1);
+select decrease_makings(7,2);
+select decrease_makings(5,1);
+select decrease_makings(5,1);
+select decrease_makings(8,3);
+select decrease_makings(7,3);
+select decrease_makings(2,2);
+select decrease_makings(8,2);
+select decrease_makings(4,5);
+
+select spisat(1);
+
+select calculate_remains();
